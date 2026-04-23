@@ -1,0 +1,553 @@
+//@version=5
+strategy("OV Strategy — GLD/SLV", shorttitle="OV-STRAT", overlay=true, initial_capital=50000, default_qty_type=strategy.percent_of_equity, default_qty_value=50, pyramiding=2, commission_type=strategy.commission.percent, commission_value=0.01, process_orders_on_close=true, calc_on_every_tick=false, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// All trading rules in this PRD derive from one instructor (Oliver Velez). The system has not been independently validated by statistical analysis on GLD/SLV historical data. Win-rate figures cited in source material (82%, 87%, 88–92%) are self-reported by the instructor and are not verified. The indicator/strategy built from this spec is an implementation of a pedagogical framework, not a proven edge.
+// The resulting TradingView indicator generates signals based on pattern-matching rules. Signals do not constitute recommendations to buy or sell. Past performance of these patterns does not guarantee future results. Users must paper trade before deploying real money.
+// Source material primarily uses high-volatility single stocks (Tesla, Meta, Coinbase, Palantir, Pepsi). GLD and SLV have materially different volatility profiles, intraday range, gap behavior, and macro-driven dynamics. Thresholds labeled "fat bar" and "power bar" in the source are calibrated to single stocks and must be adapted to GLD/SLV using Average True Range (ATR) normalization, specified in Section 5.
+// The strategy component MUST be backtested on at least 6 months of intraday data for both GLD and SLV before any real-capital deployment. Expected win rates, drawdowns, and R-multiples must be empirically measured, not assumed from source claims.
+
+// ─── L0: Context ───
+atr_length = input.int(14, "atr_length", minval=5, maxval=50)
+fab4_late_day_minutes = input.int(45, "fab4_late_day_minutes", minval=15, maxval=90)
+narrow_state_atr_mult = input.float(0.75, "narrow_state_atr_mult", minval=0.25, maxval=2.0, step=0.05)
+wide_state_atr_mult = input.float(2.5, "wide_state_atr_mult", minval=1.5, maxval=5.0, step=0.1)
+elephant_body_atr_mult = input.float(1.5, "elephant_body_atr_mult", minval=1.0, maxval=3.0, step=0.05)
+elephant_wick_ratio_max = input.float(0.25, "elephant_wick_ratio_max", minval=0.1, maxval=0.5, step=0.01)
+tail_wick_ratio_min = input.float(0.60, "tail_wick_ratio_min", minval=0.5, maxval=0.8, step=0.01)
+fat_bar_body_atr_mult = input.float(1.2, "fat_bar_body_atr_mult", minval=0.8, maxval=2.5, step=0.05)
+surge_atr_mult = input.float(2.0, "surge_atr_mult", minval=1.0, maxval=4.0, step=0.1)
+spread_atr_mult = input.float(2.5, "spread_atr_mult", minval=1.5, maxval=4.0, step=0.1)
+push_count_exit = input.int(3, "push_count_exit", minval=2, maxval=5)
+max_loss_per_trade_pct = input.float(1.0, "max_loss_per_trade_pct", minval=0.25, maxval=3.0, step=0.05)
+opening_window_minutes = input.int(20, "opening_window_minutes", minval=5, maxval=60)
+gap_extreme_min_atr = input.float(3.0, "gap_extreme_min_atr", minval=1.0, maxval=10.0, step=0.1)
+gap_extreme_max_atr = input.float(8.0, "gap_extreme_max_atr", minval=2.0, maxval=15.0, step=0.1)
+opening_time_exit_extra_minutes = input.int(10, "opening_time_exit_extra_minutes", minval=1, maxval=60)
+enable_trifecta = input.bool(true, "enable_trifecta")
+enable_color_game = input.bool(true, "enable_color_game")
+strict_instrument = input.bool(false, "strict_instrument")
+enable_vwap = input.bool(true, "show_session_vwap")
+
+rth_session = "0930-1600"
+tz = "America/New_York"
+in_rth = not na(time(timeframe.period, rth_session, tz))
+new_session = in_rth and not in_rth[1]
+end_session = not in_rth and in_rth[1]
+
+is_gld = syminfo.ticker == "GLD"
+is_slv = syminfo.ticker == "SLV"
+is_allowed_prefix = syminfo.prefix == "AMEX" or syminfo.prefix == "ARCA" or syminfo.prefix == "NYSEARCA"
+// AMBIGUITY: PRD names AMEX/ARCA; TradingView may expose ARCA as NYSEARCA. We treat NYSEARCA as ARCA-equivalent.
+instrument_allowed = (is_gld or is_slv) and is_allowed_prefix
+signals_allowed = not strict_instrument or instrument_allowed
+
+var label instrument_warning = na
+if barstate.islast
+    if not instrument_allowed
+        if not na(instrument_warning)
+            label.delete(instrument_warning)
+        instrument_warning := label.new(bar_index, high, "OV warning: use GLD/SLV on AMEX/ARCA", style=label.style_label_down, textcolor=color.white, color=color.red)
+    else if not na(instrument_warning)
+        label.delete(instrument_warning)
+        instrument_warning := na
+
+// ─── L1: Indicators ───
+atr = ta.atr(atr_length)
+sma20 = ta.sma(close, 20)
+sma200 = ta.sma(close, 200)
+sma8 = ta.sma(close, 8)
+session_vwap = ta.vwap(hlc3, new_session)
+prior_close = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_off)
+
+tf_min_raw = timeframe.in_seconds(timeframe.period) / 60.0
+timeframe_minutes = na(tf_min_raw) or tf_min_raw <= 0.0 ? 1.0 : tf_min_raw
+bars_in_opening_window = math.max(1, int(math.floor(opening_window_minutes / timeframe_minutes)))
+
+body = math.abs(close - open)
+body_prev = math.abs(close[1] - open[1])
+total_range = high - low
+total_range_safe = math.max(total_range, syminfo.mintick)
+upper_wick = high - math.max(open, close)
+lower_wick = math.min(open, close) - low
+wick_ratio = (upper_wick + lower_wick) / total_range_safe
+
+ma_separation = math.abs(sma20 - sma200)
+narrow_state = ma_separation < atr * narrow_state_atr_mult
+wide_state = ma_separation > atr * wide_state_atr_mult
+
+slope_200 = (sma200 - sma200[20]) / 20.0
+is_flat_200 = math.abs(slope_200) < atr * 0.05
+near_20 = math.abs(close - sma20) < atr * 0.75
+away_20 = math.abs(close - sma20) > atr * 2.0
+near_200 = math.abs(close - sma200) < atr * 1.0
+
+hh20 = ta.highest(high, 20)
+ll20 = ta.lowest(low, 20)
+
+cross_over_20 = ta.crossover(close, sma20)
+cross_under_20 = ta.crossunder(close, sma20)
+
+// ─── L2: Fab Four ───
+minute_of_day = hour(time, tz) * 60 + minute(time, tz)
+late_start_min = 16 * 60 - fab4_late_day_minutes
+is_late_window = in_rth and minute_of_day >= late_start_min and minute_of_day < 16 * 60
+
+var float curr_late_high = na
+var float curr_late_low = na
+var float prev_late_high = na
+var float prev_late_low = na
+
+if is_late_window
+    curr_late_high := na(curr_late_high) ? high : math.max(curr_late_high, high)
+    curr_late_low := na(curr_late_low) ? low : math.min(curr_late_low, low)
+
+if end_session
+    prev_late_high := curr_late_high
+    prev_late_low := curr_late_low
+    curr_late_high := na
+    curr_late_low := na
+
+// AMBIGUITY: PRD defines prior late-day range from exact minute math. On coarse timeframes we use available bars intersecting that window.
+prior_late_high = na(prev_late_high) ? prior_close : prev_late_high
+prior_late_low = na(prev_late_low) ? prior_close : prev_late_low
+fab4_top = math.max(math.max(math.max(sma20, sma200), prior_close), prior_late_high)
+fab4_bottom = math.min(math.min(math.min(sma20, sma200), prior_close), prior_late_low)
+fab4_mid = (fab4_top + fab4_bottom) * 0.5
+
+var box fab4_box = na
+var line fab4_top_line = na
+var line fab4_bottom_line = na
+var line prior_close_line = na
+
+if new_session
+    if not na(fab4_box)
+        box.delete(fab4_box)
+    if not na(fab4_top_line)
+        line.delete(fab4_top_line)
+    if not na(fab4_bottom_line)
+        line.delete(fab4_bottom_line)
+    if not na(prior_close_line)
+        line.delete(prior_close_line)
+    fab4_box := box.new(bar_index, fab4_top, bar_index + 1, fab4_bottom, bgcolor=color.new(color.blue, 85), border_color=color.new(color.blue, 0))
+    fab4_top_line := line.new(bar_index, fab4_top, bar_index + 1, fab4_top, color=color.new(color.blue, 0), width=2)
+    fab4_bottom_line := line.new(bar_index, fab4_bottom, bar_index + 1, fab4_bottom, color=color.new(color.blue, 0), width=2)
+    prior_close_line := line.new(bar_index, prior_close, bar_index + 1, prior_close, color=color.new(color.gray, 0), width=1, style=line.style_dotted)
+else if in_rth
+    if not na(fab4_box)
+        box.set_right(fab4_box, bar_index)
+        box.set_top(fab4_box, fab4_top)
+        box.set_bottom(fab4_box, fab4_bottom)
+    if not na(fab4_top_line)
+        line.set_xy1(fab4_top_line, line.get_x1(fab4_top_line), fab4_top)
+        line.set_xy2(fab4_top_line, bar_index, fab4_top)
+    if not na(fab4_bottom_line)
+        line.set_xy1(fab4_bottom_line, line.get_x1(fab4_bottom_line), fab4_bottom)
+        line.set_xy2(fab4_bottom_line, bar_index, fab4_bottom)
+    if not na(prior_close_line)
+        line.set_xy1(prior_close_line, line.get_x1(prior_close_line), prior_close)
+        line.set_xy2(prior_close_line, bar_index, prior_close)
+
+// ─── L3: State ───
+var int bars_since_session_open = 0
+var float session_open_price = na
+var float opening_bar_high = na
+var float opening_bar_low = na
+var int opening_position = 0
+var bool opening_extreme = false
+
+if new_session
+    bars_since_session_open := 0
+    session_open_price := open
+    opening_bar_high := high
+    opening_bar_low := low
+    opening_position := 0
+    opening_extreme := false
+else if in_rth
+    bars_since_session_open += 1
+
+if in_rth and bars_since_session_open == 0
+    opening_bar_high := high
+    opening_bar_low := low
+
+if in_rth and bars_since_session_open == 0 and barstate.isconfirmed
+    opening_position := session_open_price > fab4_top ? 3 : session_open_price < fab4_bottom ? 1 : 2
+    opening_extreme := math.abs(session_open_price - fab4_mid) / math.max(atr, syminfo.mintick) > 4.0
+
+in_opening_window = in_rth and bars_since_session_open <= bars_in_opening_window
+state_name = narrow_state ? "NARROW" : wide_state ? "WIDE" : "TRANSITIONAL"
+pos_name = opening_extreme ? "EXTREME" : opening_position == 3 ? "POS-3" : opening_position == 1 ? "POS-1" : opening_position == 2 ? "POS-2" : "UNSET"
+
+// ─── L4: Bar Classifier ───
+is_green = close > open
+is_red = close < open
+
+is_elephant = body > atr * elephant_body_atr_mult and wick_ratio <= elephant_wick_ratio_max and body > 0
+is_tail_bull = lower_wick / total_range_safe >= tail_wick_ratio_min and upper_wick / total_range_safe <= 0.2 and total_range > atr * 0.8
+is_tail_bear = upper_wick / total_range_safe >= tail_wick_ratio_min and lower_wick / total_range_safe <= 0.2 and total_range > atr * 0.8
+is_fat_bar = body > atr * fat_bar_body_atr_mult and wick_ratio < 0.4
+
+// ─── L5: Pattern Detector ───
+f_three_finger_bull(_close, _sma20, _sma200, _atr, _spread_mult) =>
+    _close < _sma20 and _sma20 < _sma200 and (_sma20 - _close) > _atr * _spread_mult and (_sma200 - _sma20) > _atr * _spread_mult
+
+f_three_finger_bear(_close, _sma20, _sma200, _atr, _spread_mult) =>
+    _close > _sma20 and _sma20 > _sma200 and (_close - _sma20) > _atr * _spread_mult and (_sma20 - _sma200) > _atr * _spread_mult
+
+f_bull_180(_is_fat_bar_prev, _prev_red, _curr_green, _curr_high, _prev_high, _curr_body, _prev_body) =>
+    _is_fat_bar_prev and _prev_red and _curr_green and _curr_high > _prev_high and _curr_body > _prev_body * 0.75
+
+f_bear_180(_is_fat_bar_prev, _prev_green, _curr_red, _curr_low, _prev_low, _curr_body, _prev_body) =>
+    _is_fat_bar_prev and _prev_green and _curr_red and _curr_low < _prev_low and _curr_body > _prev_body * 0.75
+
+is_fat_bar_prev = is_fat_bar[1]
+prev_red = close[1] < open[1]
+prev_green = close[1] > open[1]
+
+raw_bull_180 = f_bull_180(is_fat_bar_prev, prev_red, is_green, high, high[1], body, body_prev)
+raw_bear_180 = f_bear_180(is_fat_bar_prev, prev_green, is_red, low, low[1], body, body_prev)
+
+var bool power_bar_bull = false
+var bool power_bar_bear = false
+power_bar_bull := false
+power_bar_bear := false
+for n = 3 to 10
+    prior_down_move = close[n] - close > atr * 1.0
+    prior_up_move = close - close[n] > atr * 1.0
+    bull_reclaim_mid = high > close[n] - (close[n] - close) * 0.5
+    bear_break_mid = low < close[n] + (close - close[n]) * 0.5
+    power_bar_bull := power_bar_bull or (is_green and is_elephant and prior_down_move and bull_reclaim_mid)
+    power_bar_bear := power_bar_bear or (is_red and is_elephant and prior_up_move and bear_break_mid)
+
+three_finger_bull = f_three_finger_bull(close, sma20, sma200, atr, spread_atr_mult)
+three_finger_bear = f_three_finger_bear(close, sma20, sma200, atr, spread_atr_mult)
+
+var int halt_long_state = 0
+var int halt_short_state = 0
+var int below_20_count = 0
+var int above_20_count = 0
+below_20_count := close < sma20 ? below_20_count + 1 : 0
+above_20_count := close > sma20 ? above_20_count + 1 : 0
+
+if halt_long_state == 0 and below_20_count >= 10
+    halt_long_state := 1
+if halt_long_state == 1 and cross_over_20
+    halt_long_state := 2
+if halt_long_state == 2 and close > sma20 and close[1] > sma20
+    halt_long_state := 3
+if halt_long_state == 3 and low <= sma20
+    halt_long_state := 4
+if halt_long_state == 4 and close < sma20 - atr * 0.25
+    halt_long_state := 0
+halt_long_signal = halt_long_state == 4 and is_green and high > high[1]
+if halt_long_signal
+    halt_long_state := 0
+
+if halt_short_state == 0 and above_20_count >= 10
+    halt_short_state := 1
+if halt_short_state == 1 and cross_under_20
+    halt_short_state := 2
+if halt_short_state == 2 and close < sma20 and close[1] < sma20
+    halt_short_state := 3
+if halt_short_state == 3 and high >= sma20
+    halt_short_state := 4
+if halt_short_state == 4 and close > sma20 + atr * 0.25
+    halt_short_state := 0
+halt_short_signal = halt_short_state == 4 and is_red and low < low[1]
+if halt_short_signal
+    halt_short_state := 0
+
+near200_recent = near_200[3] or near_200[4] or near_200[5] or near_200[6] or near_200[7] or near_200[8]
+surge_up_raw = is_flat_200 and near200_recent and (close - sma200) > atr * surge_atr_mult and close > close[1]
+surge_down_raw = is_flat_200 and near200_recent and (sma200 - close) > atr * surge_atr_mult and close < close[1]
+
+tf2_close = request.security(syminfo.tickerid, "2", close, lookahead=barmerge.lookahead_off)
+tf2_sma200 = request.security(syminfo.tickerid, "2", ta.sma(close, 200), lookahead=barmerge.lookahead_off)
+tf2_atr = request.security(syminfo.tickerid, "2", ta.atr(atr_length), lookahead=barmerge.lookahead_off)
+tf2_flat = request.security(syminfo.tickerid, "2", math.abs((ta.sma(close, 200) - ta.sma(close, 200)[20]) / 20.0), lookahead=barmerge.lookahead_off)
+
+tf5_close = request.security(syminfo.tickerid, "5", close, lookahead=barmerge.lookahead_off)
+tf5_sma200 = request.security(syminfo.tickerid, "5", ta.sma(close, 200), lookahead=barmerge.lookahead_off)
+tf5_atr = request.security(syminfo.tickerid, "5", ta.atr(atr_length), lookahead=barmerge.lookahead_off)
+tf5_flat = request.security(syminfo.tickerid, "5", math.abs((ta.sma(close, 200) - ta.sma(close, 200)[20]) / 20.0), lookahead=barmerge.lookahead_off)
+
+tf15_close = request.security(syminfo.tickerid, "15", close, lookahead=barmerge.lookahead_off)
+tf15_sma200 = request.security(syminfo.tickerid, "15", ta.sma(close, 200), lookahead=barmerge.lookahead_off)
+tf15_atr = request.security(syminfo.tickerid, "15", ta.atr(atr_length), lookahead=barmerge.lookahead_off)
+tf15_flat = request.security(syminfo.tickerid, "15", math.abs((ta.sma(close, 200) - ta.sma(close, 200)[20]) / 20.0), lookahead=barmerge.lookahead_off)
+
+tf2_surge_up = tf2_flat < tf2_atr * 0.05 and (tf2_close - tf2_sma200) > tf2_atr * surge_atr_mult
+tf2_surge_down = tf2_flat < tf2_atr * 0.05 and (tf2_sma200 - tf2_close) > tf2_atr * surge_atr_mult
+tf5_surge_up = tf5_flat < tf5_atr * 0.05 and (tf5_close - tf5_sma200) > tf5_atr * surge_atr_mult
+tf5_surge_down = tf5_flat < tf5_atr * 0.05 and (tf5_sma200 - tf5_close) > tf5_atr * surge_atr_mult
+tf15_surge_up = tf15_flat < tf15_atr * 0.05 and (tf15_close - tf15_sma200) > tf15_atr * surge_atr_mult
+tf15_surge_down = tf15_flat < tf15_atr * 0.05 and (tf15_sma200 - tf15_close) > tf15_atr * surge_atr_mult
+
+trifecta_up_raw = enable_trifecta and tf2_surge_up and tf5_surge_up and tf15_surge_up
+trifecta_down_raw = enable_trifecta and tf2_surge_down and tf5_surge_down and tf15_surge_down
+
+ll_idx = ta.lowestbars(low, 20)
+hh_idx = ta.highestbars(high, 20)
+l1_low = low[math.abs(ll_idx)]
+h1_high = high[math.abs(hh_idx)]
+rally_from_l1 = hh20 - l1_low
+drop_from_h1 = h1_high - ll20
+l2_valid = low >= l1_low or (l1_low - low) < atr * 0.3
+h2_valid = high <= h1_high or (high - h1_high) < atr * 0.3
+market_law_4_bull_raw = rally_from_l1 >= atr * 2.0 and l2_valid and (raw_bull_180 or power_bar_bull)
+market_law_4_bear_raw = drop_from_h1 >= atr * 2.0 and h2_valid and (raw_bear_180 or power_bar_bear)
+
+// AMBIGUITY: Hidden green/red needs intrabar excursion evidence. Pine historical bars do not preserve path, so we approximate with high/low vs open.
+hidden_red_excursion = upper_wick > syminfo.mintick
+hidden_green_excursion = lower_wick > syminfo.mintick
+hidden_red_raw = in_opening_window and bars_since_session_open == 0 and opening_position == 3 and is_red and hidden_red_excursion and close < session_open_price
+hidden_green_raw = in_opening_window and bars_since_session_open == 0 and opening_position == 1 and is_green and hidden_green_excursion and close > session_open_price
+
+gap_extreme = math.abs(session_open_price - fab4_mid) / math.max(atr, syminfo.mintick)
+fade_window_ok = in_opening_window and bars_since_session_open <= 3 and gap_extreme > gap_extreme_min_atr and gap_extreme < gap_extreme_max_atr
+pos3_fade_raw = fade_window_ok and opening_position == 3 and (raw_bear_180 or is_tail_bear or (is_elephant and is_red))
+pos1_fade_raw = fade_window_ok and opening_position == 1 and (raw_bull_180 or is_tail_bull or (is_elephant and is_green))
+
+opening_bar_elephant = is_elephant and bars_since_session_open == 0
+opening_bar_tail_bull = is_tail_bull and bars_since_session_open == 0
+opening_bar_tail_bear = is_tail_bear and bars_since_session_open == 0
+narrow_break_long_raw = in_opening_window and narrow_state and opening_position == 3 and not opening_extreme and (opening_bar_elephant or opening_bar_tail_bull)
+narrow_break_short_raw = in_opening_window and narrow_state and opening_position == 1 and not opening_extreme and (opening_bar_elephant or opening_bar_tail_bear)
+
+// ─── L6: Signal Aggregator ───
+confirmed = barstate.isconfirmed
+trap_zone = opening_position == 2
+
+bull_180 = raw_bull_180 and confirmed and in_rth and signals_allowed and not trap_zone
+bear_180 = raw_bear_180 and confirmed and in_rth and signals_allowed and not trap_zone
+power_bar_bull_sig = power_bar_bull and confirmed and in_rth and signals_allowed and not trap_zone
+power_bar_bear_sig = power_bar_bear and confirmed and in_rth and signals_allowed and not trap_zone
+halt_long = halt_long_signal and confirmed and in_rth and signals_allowed and not trap_zone
+halt_short = halt_short_signal and confirmed and in_rth and signals_allowed and not trap_zone
+surge_up = surge_up_raw and confirmed and in_rth and signals_allowed and not trap_zone
+surge_down = surge_down_raw and confirmed and in_rth and signals_allowed and not trap_zone
+trifecta_up = trifecta_up_raw and confirmed and in_rth and signals_allowed and not trap_zone
+trifecta_down = trifecta_down_raw and confirmed and in_rth and signals_allowed and not trap_zone
+market_law_4_bull = market_law_4_bull_raw and confirmed and in_rth and signals_allowed and not trap_zone
+market_law_4_bear = market_law_4_bear_raw and confirmed and in_rth and signals_allowed and not trap_zone
+three_finger_bull_sig = three_finger_bull and confirmed and in_rth and signals_allowed and not trap_zone
+three_finger_bear_sig = three_finger_bear and confirmed and in_rth and signals_allowed and not trap_zone
+hidden_green = hidden_green_raw and confirmed and in_rth and signals_allowed and not trap_zone
+hidden_red = hidden_red_raw and confirmed and in_rth and signals_allowed and not trap_zone
+pos3_fade = pos3_fade_raw and confirmed and in_rth and signals_allowed and not trap_zone
+pos1_fade = pos1_fade_raw and confirmed and in_rth and signals_allowed and not trap_zone
+narrow_break_long = narrow_break_long_raw and confirmed and in_rth and signals_allowed and not trap_zone
+narrow_break_short = narrow_break_short_raw and confirmed and in_rth and signals_allowed and not trap_zone
+
+reversal_signal_count = (bull_180 ? 1 : 0) + (bear_180 ? 1 : 0) + (power_bar_bull_sig ? 1 : 0) + (power_bar_bear_sig ? 1 : 0) + (halt_long ? 1 : 0) + (halt_short ? 1 : 0)
+trend_signal_count = (surge_up ? 1 : 0) + (surge_down ? 1 : 0) + (trifecta_up ? 1 : 0) + (trifecta_down ? 1 : 0) + (market_law_4_bull ? 1 : 0) + (market_law_4_bear ? 1 : 0)
+context_signal_count = (three_finger_bull_sig ? 1 : 0) + (three_finger_bear_sig ? 1 : 0) + (hidden_green ? 1 : 0) + (hidden_red ? 1 : 0) + (pos3_fade ? 1 : 0) + (pos1_fade ? 1 : 0) + (narrow_break_long ? 1 : 0) + (narrow_break_short ? 1 : 0)
+signal_count = reversal_signal_count + trend_signal_count + context_signal_count
+
+stack_s1 = signal_count >= 2
+stack_s2 = (trifecta_up or trifecta_down) and signal_count >= 2
+stack_s3 = (three_finger_bull_sig or three_finger_bear_sig) and (market_law_4_bull or market_law_4_bear) and (power_bar_bull_sig or power_bar_bear_sig or bull_180 or bear_180)
+
+three_finger_stack = (three_finger_bull_sig or three_finger_bear_sig) and (bull_180 or bear_180 or power_bar_bull_sig or power_bar_bear_sig)
+
+// ─── L7: Trade Manager ───
+tick_size = syminfo.mintick
+risk_per_unit = atr > 0 ? atr : tick_size
+risk_fraction = max_loss_per_trade_pct / 100.0
+capital_risk = strategy.equity * risk_fraction
+qty_calc = math.max(1.0, capital_risk / risk_per_unit)
+
+long_signal = bull_180 or power_bar_bull_sig or halt_long or surge_up or trifecta_up or market_law_4_bull or hidden_green or pos1_fade or narrow_break_long
+short_signal = bear_180 or power_bar_bear_sig or halt_short or surge_down or trifecta_down or market_law_4_bear or hidden_red or pos3_fade or narrow_break_short
+
+is_opening_window_signal = pos1_fade or pos3_fade or narrow_break_long or narrow_break_short or hidden_green or hidden_red
+
+if long_signal and strategy.position_size <= 0 and signals_allowed
+    strategy.entry("LONG", strategy.long, qty=qty_calc)
+if short_signal and strategy.position_size >= 0 and signals_allowed
+    strategy.entry("SHORT", strategy.short, qty=qty_calc)
+
+var float hard_stop_long = na
+var float hard_stop_short = na
+var float trail_stop_long = na
+var float trail_stop_short = na
+var int push_count_long = 0
+var int push_count_short = 0
+var int adds_long = 0
+var int adds_short = 0
+var int entry_bar_index = na
+var bool opening_window_entry = false
+
+new_long = strategy.position_size > 0 and strategy.position_size[1] <= 0
+new_short = strategy.position_size < 0 and strategy.position_size[1] >= 0
+flat_now = strategy.position_size == 0
+
+if new_long
+    hard_stop_long := low - tick_size
+    trail_stop_long := hard_stop_long
+    hard_stop_short := na
+    trail_stop_short := na
+    push_count_long := 0
+    adds_long := 0
+    entry_bar_index := bar_index
+    opening_window_entry := is_opening_window_signal
+
+if new_short
+    hard_stop_short := high + tick_size
+    trail_stop_short := hard_stop_short
+    hard_stop_long := na
+    trail_stop_long := na
+    push_count_short := 0
+    adds_short := 0
+    entry_bar_index := bar_index
+    opening_window_entry := is_opening_window_signal
+
+if flat_now
+    hard_stop_long := na
+    hard_stop_short := na
+    trail_stop_long := na
+    trail_stop_short := na
+    push_count_long := 0
+    push_count_short := 0
+    adds_long := 0
+    adds_short := 0
+    entry_bar_index := na
+    if near_20
+        opening_window_entry := false
+
+trail_update_long = strategy.position_size > 0 and body > atr * 1.3 and close > open
+trail_update_short = strategy.position_size < 0 and body > atr * 1.3 and close < open
+
+if trail_update_long
+    trail_stop_long := na(trail_stop_long) ? low - tick_size : math.max(trail_stop_long, low - tick_size)
+if trail_update_short
+    trail_stop_short := na(trail_stop_short) ? high + tick_size : math.min(trail_stop_short, high + tick_size)
+
+color_pattern_long = strategy.position_size > 0 and is_red[2] and is_green[1] and is_green
+color_pattern_short = strategy.position_size < 0 and is_green[2] and is_red[1] and is_red
+if color_pattern_long
+    trail_stop_long := na(trail_stop_long) ? low[2] - tick_size : math.max(trail_stop_long, low[2] - tick_size)
+if color_pattern_short
+    trail_stop_short := na(trail_stop_short) ? high[2] + tick_size : math.min(trail_stop_short, high[2] + tick_size)
+
+push_bar_bull = close > open and body > atr * 0.5
+push_bar_bear = close < open and body > atr * 0.5
+push_up = strategy.position_size > 0 and close > close[1] and push_bar_bull
+push_down = strategy.position_size < 0 and close < close[1] and push_bar_bear
+
+if push_up and not push_up[1]
+    push_count_long += 1
+if push_down and not push_down[1]
+    push_count_short += 1
+
+if strategy.position_size > 0 and push_count_long == 1
+    strategy.close("LONG", qty_percent=25)
+if strategy.position_size > 0 and push_count_long == 2
+    strategy.close("LONG", qty_percent=25)
+if strategy.position_size < 0 and push_count_short == 1
+    strategy.close("SHORT", qty_percent=25)
+if strategy.position_size < 0 and push_count_short == 2
+    strategy.close("SHORT", qty_percent=25)
+
+if strategy.position_size > 0 and push_count_long >= push_count_exit
+    strategy.close("LONG")
+if strategy.position_size < 0 and push_count_short >= push_count_exit
+    strategy.close("SHORT")
+
+// AMBIGUITY: PRD color game references reserve allocation but not exact sizing basis. We apply half ATR-risk size per add, max 2 adds.
+first_red_after_entry = strategy.position_size > 0 and is_red
+first_green_after_entry = strategy.position_size < 0 and is_green
+add_long_trigger = enable_color_game and strategy.position_size > 0 and first_red_after_entry[1] and is_green and high > high[1] and not away_20
+add_short_trigger = enable_color_game and strategy.position_size < 0 and first_green_after_entry[1] and is_red and low < low[1] and not away_20
+
+if add_long_trigger and adds_long < 2
+    if adds_long == 0
+        strategy.entry("LONG_ADD_1", strategy.long, qty=qty_calc * 0.5)
+    else
+        strategy.entry("LONG_ADD_2", strategy.long, qty=qty_calc * 0.5)
+    adds_long += 1
+if add_short_trigger and adds_short < 2
+    if adds_short == 0
+        strategy.entry("SHORT_ADD_1", strategy.short, qty=qty_calc * 0.5)
+    else
+        strategy.entry("SHORT_ADD_2", strategy.short, qty=qty_calc * 0.5)
+    adds_short += 1
+
+if strategy.position_size > 0 and narrow_state[1] and wide_state and away_20
+    strategy.close("LONG")
+if strategy.position_size < 0 and narrow_state[1] and wide_state and away_20
+    strategy.close("SHORT")
+
+bars_since_entry = na(entry_bar_index) ? 0 : bar_index - entry_bar_index
+time_exit_limit_bars = bars_in_opening_window + math.max(1, int(math.floor(opening_time_exit_extra_minutes / timeframe_minutes)))
+if opening_window_entry and strategy.position_size != 0 and bars_since_entry >= time_exit_limit_bars
+    if strategy.position_size > 0
+        strategy.close("LONG")
+    if strategy.position_size < 0
+        strategy.close("SHORT")
+
+final_stop_long = na(trail_stop_long) ? hard_stop_long : math.max(hard_stop_long, trail_stop_long)
+final_stop_short = na(trail_stop_short) ? hard_stop_short : math.min(hard_stop_short, trail_stop_short)
+
+if strategy.position_size > 0 and not na(final_stop_long)
+    strategy.exit("LONG_EXIT", "LONG", stop=final_stop_long)
+if strategy.position_size < 0 and not na(final_stop_short)
+    strategy.exit("SHORT_EXIT", "SHORT", stop=final_stop_short)
+
+// ─── L8: Visualization ───
+plot(sma20, "20 SMA", color=color.new(color.blue, 0), linewidth=2)
+plot(sma200, "200 SMA", color=color.new(color.red, 0), linewidth=2)
+plot(sma8, "8 SMA", color=color.new(color.green, 0), linewidth=1, style=plot.style_circles)
+plot(enable_vwap ? session_vwap : na, "Session VWAP", color=color.new(color.orange, 0), linewidth=1)
+plot(strategy.position_size > 0 ? final_stop_long : na, "Long Stop", color=color.new(color.red, 0), linewidth=1)
+plot(strategy.position_size < 0 ? final_stop_short : na, "Short Stop", color=color.new(color.red, 0), linewidth=1)
+
+bgcolor(three_finger_bull_sig or three_finger_bear_sig ? color.new(color.yellow, 87) : na)
+
+plotshape(bull_180, title="Bull 180", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.tiny)
+plotshape(bear_180, title="Bear 180", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny)
+plotshape(power_bar_bull_sig, title="Power Bull", style=shape.diamond, location=location.belowbar, color=color.lime, size=size.tiny)
+plotshape(power_bar_bear_sig, title="Power Bear", style=shape.diamond, location=location.abovebar, color=color.red, size=size.tiny)
+plotshape(halt_long or halt_short, title="Halt", style=shape.circle, location=location.abovebar, color=color.blue, size=size.tiny)
+plotshape(surge_up or surge_down, title="Surge", style=shape.arrowup, location=location.abovebar, color=color.purple, size=size.tiny)
+plotshape(trifecta_up or trifecta_down, title="Trifecta", style=shape.star, location=location.abovebar, color=color.gold, size=size.small)
+plotshape(market_law_4_bull or market_law_4_bear, title="Market Law 4", style=shape.square, location=location.abovebar, color=color.teal, size=size.tiny)
+plotshape(stack_s2 and not stack_s3, title="Stack S2", style=shape.labelup, location=location.abovebar, color=color.new(color.gold, 0), text="S2")
+plotshape(stack_s3, title="Stack S3", style=shape.labelup, location=location.abovebar, color=color.new(color.gold, 0), text="S3")
+plotshape(trap_zone and in_opening_window and bars_since_session_open == 0, title="Trap Zone", style=shape.xcross, location=location.abovebar, color=color.red, size=size.tiny)
+plotshape(three_finger_stack, title="Three Finger Stack", style=shape.labeldown, location=location.belowbar, color=color.new(color.yellow, 0), text="3F")
+
+var table state_table = table.new(position.top_right, 2, 4, border_width=1)
+if barstate.islast
+    table.cell(state_table, 0, 0, "State", text_color=color.white, bgcolor=color.gray)
+    table.cell(state_table, 1, 0, state_name, text_color=color.white, bgcolor=color.black)
+    table.cell(state_table, 0, 1, "Position", text_color=color.white, bgcolor=color.gray)
+    table.cell(state_table, 1, 1, pos_name, text_color=color.white, bgcolor=color.black)
+    table.cell(state_table, 0, 2, "Opening", text_color=color.white, bgcolor=color.gray)
+    table.cell(state_table, 1, 2, in_opening_window ? "YES" : "NO", text_color=color.white, bgcolor=color.black)
+    table.cell(state_table, 0, 3, "Signals", text_color=color.white, bgcolor=color.gray)
+    table.cell(state_table, 1, 3, str.tostring(signal_count), text_color=color.white, bgcolor=color.black)
+
+// ─── L9: Alerts ───
+alertcondition(bull_180, "OV_BULL_180", "OV_BULL_180")
+alertcondition(bear_180, "OV_BEAR_180", "OV_BEAR_180")
+alertcondition(power_bar_bull_sig, "OV_POWER_BAR_BULL", "OV_POWER_BAR_BULL")
+alertcondition(power_bar_bear_sig, "OV_POWER_BAR_BEAR", "OV_POWER_BAR_BEAR")
+alertcondition(halt_long, "OV_HALT_LONG", "OV_HALT_LONG")
+alertcondition(halt_short, "OV_HALT_SHORT", "OV_HALT_SHORT")
+alertcondition(surge_up, "OV_SURGE_UP", "OV_SURGE_UP")
+alertcondition(surge_down, "OV_SURGE_DOWN", "OV_SURGE_DOWN")
+alertcondition(trifecta_up, "OV_TRIFECTA_UP", "OV_TRIFECTA_UP")
+alertcondition(trifecta_down, "OV_TRIFECTA_DOWN", "OV_TRIFECTA_DOWN")
+alertcondition(market_law_4_bull, "OV_MARKET_LAW_4_BULL", "OV_MARKET_LAW_4_BULL")
+alertcondition(market_law_4_bear, "OV_MARKET_LAW_4_BEAR", "OV_MARKET_LAW_4_BEAR")
+alertcondition(three_finger_bull_sig, "OV_THREE_FINGER_BULL", "OV_THREE_FINGER_BULL")
+alertcondition(three_finger_bear_sig, "OV_THREE_FINGER_BEAR", "OV_THREE_FINGER_BEAR")
+alertcondition(hidden_green, "OV_HIDDEN_GREEN", "OV_HIDDEN_GREEN")
+alertcondition(hidden_red, "OV_HIDDEN_RED", "OV_HIDDEN_RED")
+alertcondition(pos3_fade, "OV_POS3_FADE", "OV_POS3_FADE")
+alertcondition(pos1_fade, "OV_POS1_FADE", "OV_POS1_FADE")
+alertcondition(narrow_break_long, "OV_NARROW_BREAK_LONG", "OV_NARROW_BREAK_LONG")
+alertcondition(narrow_break_short, "OV_NARROW_BREAK_SHORT", "OV_NARROW_BREAK_SHORT")
+alertcondition(stack_s1, "OV_STACK_S1", "OV_STACK_S1")
+alertcondition(stack_s2, "OV_STACK_S2", "OV_STACK_S2")
+alertcondition(stack_s3, "OV_STACK_S3", "OV_STACK_S3")
