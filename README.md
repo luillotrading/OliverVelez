@@ -25,8 +25,11 @@
 - `push_count_exit` (3): Strategy exit after N pushes.
 - `max_loss_per_trade_pct` (1.0): Strategy risk budget per trade.
 - `opening_window_minutes` (20): Opening window for opening setups.
+- `gap_extreme_min_atr` (3.0): Minimum ATR-normalized opening gap for fade setups.
+- `gap_extreme_max_atr` (8.0): Maximum ATR-normalized opening gap for fade setups.
 - `enable_trifecta` (true): Enable 2m/5m/15m trifecta checks.
 - `enable_color_game` (true): Enable strategy add-on entries.
+- `opening_time_exit_extra_minutes` (10, strategy): Extra minutes added to opening-window bars when computing the forced time-exit limit for opening-window entries.
 
 ### GLD vs SLV recommendation
 Use the same defaults first; then calibrate ATR-multiple thresholds (`elephant_body_atr_mult`, `fat_bar_body_atr_mult`, `surge_atr_mult`, `spread_atr_mult`) after instrument-specific backtests because SLV often exhibits different intraday volatility than GLD.

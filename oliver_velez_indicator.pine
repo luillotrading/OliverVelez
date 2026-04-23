@@ -17,9 +17,9 @@ tail_wick_ratio_min = input.float(0.60, "tail_wick_ratio_min", minval=0.5, maxva
 fat_bar_body_atr_mult = input.float(1.2, "fat_bar_body_atr_mult", minval=0.8, maxval=2.5, step=0.05)
 surge_atr_mult = input.float(2.0, "surge_atr_mult", minval=1.0, maxval=4.0, step=0.1)
 spread_atr_mult = input.float(2.5, "spread_atr_mult", minval=1.5, maxval=4.0, step=0.1)
-push_count_exit = input.int(3, "push_count_exit", minval=2, maxval=5)
-max_loss_per_trade_pct = input.float(1.0, "max_loss_per_trade_pct", minval=0.25, maxval=3.0, step=0.05)
 opening_window_minutes = input.int(20, "opening_window_minutes", minval=5, maxval=60)
+gap_extreme_min_atr = input.float(3.0, "gap_extreme_min_atr", minval=1.0, maxval=10.0, step=0.1)
+gap_extreme_max_atr = input.float(8.0, "gap_extreme_max_atr", minval=2.0, maxval=15.0, step=0.1)
 enable_trifecta = input.bool(true, "enable_trifecta")
 enable_color_game = input.bool(true, "enable_color_game")
 strict_instrument = input.bool(false, "strict_instrument")
@@ -53,7 +53,7 @@ atr = ta.atr(atr_length)
 sma20 = ta.sma(close, 20)
 sma200 = ta.sma(close, 200)
 sma8 = ta.sma(close, 8)
-session_vwap = ta.vwap(hlc3)
+session_vwap = ta.vwap(hlc3, new_session)
 prior_close = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_off)
 
 tf_min_raw = timeframe.in_seconds(timeframe.period) / 60.0
@@ -80,8 +80,6 @@ near_200 = math.abs(close - sma200) < atr * 1.0
 
 hh20 = ta.highest(high, 20)
 ll20 = ta.lowest(low, 20)
-hh10 = ta.highest(high, 10)
-ll10 = ta.lowest(low, 10)
 cross_over_20 = ta.crossover(close, sma20)
 cross_under_20 = ta.crossunder(close, sma20)
 
@@ -209,12 +207,12 @@ var bool power_bar_bear = false
 power_bar_bull := false
 power_bar_bear := false
 for n = 3 to 10
-    up_move = close[n] - close > atr * 1.0
-    down_move = close - close[n] > atr * 1.0
-    bull_wipe = high > close[n] - (close[n] - close) * 0.5
-    bear_wipe = low < close[n] + (close - close[n]) * 0.5
-    power_bar_bull := power_bar_bull or (is_green and is_elephant and up_move and bull_wipe)
-    power_bar_bear := power_bar_bear or (is_red and is_elephant and down_move and bear_wipe)
+    prior_down_move = close[n] - close > atr * 1.0
+    prior_up_move = close - close[n] > atr * 1.0
+    bull_reclaim_mid = high > close[n] - (close[n] - close) * 0.5
+    bear_break_mid = low < close[n] + (close - close[n]) * 0.5
+    power_bar_bull := power_bar_bull or (is_green and is_elephant and prior_down_move and bull_reclaim_mid)
+    power_bar_bear := power_bar_bear or (is_red and is_elephant and prior_up_move and bear_break_mid)
 
 three_finger_bull = f_three_finger_bull(close, sma20, sma200, atr, spread_atr_mult)
 three_finger_bear = f_three_finger_bear(close, sma20, sma200, atr, spread_atr_mult)
@@ -295,11 +293,13 @@ market_law_4_bull_raw = rally_from_l1 >= atr * 2.0 and l2_valid and (raw_bull_18
 market_law_4_bear_raw = drop_from_h1 >= atr * 2.0 and h2_valid and (raw_bear_180 or power_bar_bear)
 
 // AMBIGUITY: Hidden green/red needs intrabar excursion evidence. Pine historical bars do not preserve path, so we approximate with high/low vs open.
-hidden_red_raw = in_opening_window and bars_since_session_open == 0 and opening_position == 1 and open > close and high > open and close < session_open_price
-hidden_green_raw = in_opening_window and bars_since_session_open == 0 and opening_position == 3 and open < close and low < open and close > session_open_price
+hidden_red_excursion = upper_wick > syminfo.mintick
+hidden_green_excursion = lower_wick > syminfo.mintick
+hidden_red_raw = in_opening_window and bars_since_session_open == 0 and opening_position == 3 and is_red and hidden_red_excursion and close < session_open_price
+hidden_green_raw = in_opening_window and bars_since_session_open == 0 and opening_position == 1 and is_green and hidden_green_excursion and close > session_open_price
 
 gap_extreme = math.abs(session_open_price - fab4_mid) / math.max(atr, syminfo.mintick)
-fade_window_ok = in_opening_window and bars_since_session_open <= 3 and gap_extreme > 3.0 and gap_extreme < 8.0
+fade_window_ok = in_opening_window and bars_since_session_open <= 3 and gap_extreme > gap_extreme_min_atr and gap_extreme < gap_extreme_max_atr
 pos3_fade_raw = fade_window_ok and opening_position == 3 and (raw_bear_180 or is_tail_bear or (is_elephant and is_red))
 pos1_fade_raw = fade_window_ok and opening_position == 1 and (raw_bull_180 or is_tail_bull or (is_elephant and is_green))
 
@@ -334,7 +334,10 @@ pos1_fade = pos1_fade_raw and confirmed and in_rth and signals_allowed and not t
 narrow_break_long = narrow_break_long_raw and confirmed and in_rth and signals_allowed and not trap_zone
 narrow_break_short = narrow_break_short_raw and confirmed and in_rth and signals_allowed and not trap_zone
 
-signal_count = (bull_180 ? 1 : 0) + (bear_180 ? 1 : 0) + (power_bar_bull_sig ? 1 : 0) + (power_bar_bear_sig ? 1 : 0) + (halt_long ? 1 : 0) + (halt_short ? 1 : 0) + (surge_up ? 1 : 0) + (surge_down ? 1 : 0) + (trifecta_up ? 1 : 0) + (trifecta_down ? 1 : 0) + (market_law_4_bull ? 1 : 0) + (market_law_4_bear ? 1 : 0) + (three_finger_bull_sig ? 1 : 0) + (three_finger_bear_sig ? 1 : 0) + (hidden_green ? 1 : 0) + (hidden_red ? 1 : 0) + (pos3_fade ? 1 : 0) + (pos1_fade ? 1 : 0) + (narrow_break_long ? 1 : 0) + (narrow_break_short ? 1 : 0)
+reversal_signal_count = (bull_180 ? 1 : 0) + (bear_180 ? 1 : 0) + (power_bar_bull_sig ? 1 : 0) + (power_bar_bear_sig ? 1 : 0) + (halt_long ? 1 : 0) + (halt_short ? 1 : 0)
+trend_signal_count = (surge_up ? 1 : 0) + (surge_down ? 1 : 0) + (trifecta_up ? 1 : 0) + (trifecta_down ? 1 : 0) + (market_law_4_bull ? 1 : 0) + (market_law_4_bear ? 1 : 0)
+context_signal_count = (three_finger_bull_sig ? 1 : 0) + (three_finger_bear_sig ? 1 : 0) + (hidden_green ? 1 : 0) + (hidden_red ? 1 : 0) + (pos3_fade ? 1 : 0) + (pos1_fade ? 1 : 0) + (narrow_break_long ? 1 : 0) + (narrow_break_short ? 1 : 0)
+signal_count = reversal_signal_count + trend_signal_count + context_signal_count
 
 stack_s1 = signal_count >= 2
 stack_s2 = (trifecta_up or trifecta_down) and signal_count >= 2
